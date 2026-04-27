@@ -1,0 +1,7 @@
+numpy>=1.24
+scipy>=1.10
+pytest>=7.0
+# Optional real benchmarks:
+# nas-bench-api    → pip install nas-bench-api
+# yahpo-gym        → pip install yahpo-gym
+# nomad            → https://github.com/bbopt/nomad
