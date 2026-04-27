@@ -1,0 +1,139 @@
+"""
+NASBench-201 runner — run with --simulate (no data file needed)
+    python run_nasbench.py --simulate --n_runs 10 --n_eval 100
+Real data:
+    pip install nas-bench-api
+    python run_nasbench.py --data_file NAS-Bench-201.pth --n_runs 10
+"""
+import argparse, json, time
+from pathlib import Path
+import numpy as np
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from catexplain.cta import CanonicalTrajectoryAttribution
+from baselines.baselines import SHAPWrapper, Ablation
+from scipy.stats import kendalltau
+
+OPS   = ["none", "skip_connect", "nor_conv_1x1", "nor_conv_3x3", "avg_pool_3x3"]
+EDGES = ["edge_0_1","edge_0_2","edge_0_3","edge_1_2","edge_1_3","edge_2_3"]
+
+GROUND_TRUTH_RANK = {
+    "edge_1_3": 1, "edge_2_3": 2, "edge_1_2": 3,
+    "edge_0_3": 4, "edge_0_2": 5, "edge_0_1": 6,
+}
+
+def index_to_config(idx):
+    config, r = {}, idx
+    for edge in reversed(EDGES):
+        config[edge] = OPS[r % len(OPS)]
+        r //= len(OPS)
+    return config
+
+def config_to_index(config):
+    idx = 0
+    for edge in EDGES:
+        idx = idx * len(OPS) + OPS.index(config[edge])
+    return idx
+
+def synthetic_accuracy(config, dataset="cifar10"):
+    op_effects = {"nor_conv_3x3":1.0,"nor_conv_1x1":0.7,"avg_pool_3x3":0.3,
+                  "skip_connect":0.1,"none":-0.5}
+    edge_weights = {"edge_1_3":1.0,"edge_2_3":0.8,"edge_1_2":0.6,
+                    "edge_0_3":0.4,"edge_0_2":0.25,"edge_0_1":0.1}
+    base = 88.0 if dataset == "cifar10" else 65.0
+    return base + sum(edge_weights[e]*op_effects[config[e]] for e in EDGES)
+
+def bo_trajectory(api, dataset, n_eval, seed, simulate=False):
+    rng = np.random.default_rng(seed)
+    traj, observed = [], {}
+    def evaluate(idx):
+        cfg = index_to_config(idx)
+        if simulate:
+            f = -(synthetic_accuracy(cfg, dataset) + rng.normal(0, 0.3))
+        else:
+            f = -api.query_by_index(idx, dataset).get_metrics(dataset,"x-valid")["accuracy"]
+        return cfg, f
+    n_init = max(5, n_eval // 10)
+    for idx in rng.choice(15625, n_init, replace=False):
+        cfg, f = evaluate(int(idx))
+        traj.append((cfg, f)); observed[int(idx)] = f
+    for _ in range(n_eval - n_init):
+        if rng.random() < 0.2:
+            idx = int(rng.integers(15625))
+        else:
+            best_idx = min(observed, key=observed.get)
+            best_cfg = index_to_config(best_idx)
+            cands = [config_to_index({**best_cfg, edge: op})
+                     for edge in EDGES for op in OPS if op != best_cfg[edge]]
+            idx = int(rng.choice(cands)) if cands else int(rng.integers(15625))
+        cfg, f = evaluate(idx)
+        traj.append((cfg, f)); observed[idx] = f
+    return traj
+
+def run(dataset="cifar10", n_runs=10, n_eval=100, simulate=True, data_file=None):
+    api = None
+    if not simulate and data_file:
+        try:
+            from nas_201_api import NASBench201API
+            api = NASBench201API(data_file, verbose=False)
+        except ImportError:
+            print("nas-bench-api not installed — using simulation"); simulate=True
+    else:
+        simulate = True
+
+    print(f"\nNASBench-201 | {dataset} | runs={n_runs} | evals={n_eval} | sim={simulate}")
+    tau_cta, tau_shap, f1_cta, f1_shap, rts = [], [], [], [], []
+    cta_all = []
+
+    for r in range(n_runs):
+        traj = bo_trajectory(api, dataset, n_eval, seed=r, simulate=simulate)
+        t0 = time.perf_counter()
+        model = CanonicalTrajectoryAttribution(traj, EDGES)
+        cta = model.exact_cta()
+        rts.append(time.perf_counter()-t0)
+        cta_all.append(cta)
+        shap = SHAPWrapper(traj, EDGES).compute()
+        pred_cta  = {v:i+1 for i,(v,_) in enumerate(sorted(cta.items(), key=lambda x:-abs(x[1])))}
+        pred_shap = {v:i+1 for i,(v,_) in enumerate(sorted(shap.items(),key=lambda x:-abs(x[1])))}
+        gt = [GROUND_TRUTH_RANK[v] for v in EDGES]
+        tau_cta.append( kendalltau(gt,[pred_cta[v]  for v in EDGES])[0])
+        tau_shap.append(kendalltau(gt,[pred_shap[v] for v in EDGES])[0])
+        f1_cta.append( CanonicalTrajectoryAttribution.faithfulness(cta, traj, k=1))
+        f1_shap.append(CanonicalTrajectoryAttribution.faithfulness(shap,traj, k=1))
+        print(f"  Run {r+1:2d}: τ_CTA={tau_cta[-1]:.3f}  τ_SHAP={tau_shap[-1]:.3f}  "
+              f"faith@1_CTA={f1_cta[-1]:.3f}  rt={rts[-1]:.2f}s")
+
+    mean_cta = {v: float(np.mean([s[v] for s in cta_all])) for v in EDGES}
+    results = {
+        "dataset": dataset, "n_runs": n_runs, "simulated": simulate,
+        "kendall_tau":      {"CTA":float(np.mean(tau_cta)), "SHAP":float(np.mean(tau_shap))},
+        "faithfulness_at_1":{"CTA":float(np.mean(f1_cta)),  "SHAP":float(np.mean(f1_shap))},
+        "runtime_s":         float(np.mean(rts)),
+        "mean_cta_scores":   mean_cta,
+    }
+    print(f"\n  Kendall τ — CTA: {results['kendall_tau']['CTA']:.3f}  "
+          f"SHAP: {results['kendall_tau']['SHAP']:.3f}")
+    print(f"  Faith@1  — CTA: {results['faithfulness_at_1']['CTA']:.3f}  "
+          f"SHAP: {results['faithfulness_at_1']['SHAP']:.3f}")
+    print("\n  CTA scores vs ground truth:")
+    for v, s in sorted(mean_cta.items(), key=lambda x: -abs(x[1])):
+        print(f"    {v:15s}: {s:+.4f}  (GT rank {GROUND_TRUTH_RANK[v]})")
+    return results
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset",    choices=["cifar10","cifar100","both"], default="cifar10")
+    p.add_argument("--n_runs",     type=int, default=10)
+    p.add_argument("--n_eval",     type=int, default=100)
+    p.add_argument("--simulate",   action="store_true")
+    p.add_argument("--data_file",  type=str, default=None)
+    p.add_argument("--output_dir", type=str, default="results")
+    args = p.parse_args()
+    Path(args.output_dir).mkdir(exist_ok=True)
+    datasets = ["cifar10","cifar100"] if args.dataset=="both" else [args.dataset]
+    all_res = {}
+    for ds in datasets:
+        all_res[ds] = run(ds, args.n_runs, args.n_eval, args.simulate, args.data_file)
+    out = Path(args.output_dir)/"nasbench_results.json"
+    json.dump(all_res, open(out,"w"), indent=2)
+    print(f"\nSaved → {out}")
